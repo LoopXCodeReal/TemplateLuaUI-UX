@@ -1811,7 +1811,7 @@ do
 	local GS = Shared.ElenaGodShared
 	GS.hum, GS.hrp, GS.lastPos = nil, nil, nil
 	GS.suspendUntil, GS.flying = 0, false
-	GS.anchor, GS.anchorAt = nil, 0
+	GS.pred, GS.anchorAt = nil, 0
 
 	local rawIndex, rawNewIndex, hooksInstalled
 	local noclipMemory, flyBV, flyBG = {}, nil, nil
@@ -1919,40 +1919,66 @@ do
 			end
 		end)
 
-		-- The server applies PvP knockback authoritatively: impulse, BodyVelocity or
-		-- a direct CFrame shove. Killing velocity alone cannot win that fight, so
-		-- keep a horizontal anchor and undo ANY displacement the player did not
-		-- ask for. Hub teleports/farming whitelist themselves through GOD.sync().
+		-- Track where the player's INPUT says they should be, not where they ended
+		-- up. The old anchor used the last accepted position, so any small shove
+		-- got baked into the next anchor and accumulated into a launch. A predicted
+		-- position keeps drift constant instead of compounding, and correcting only
+		-- a visible deviation stops the walking stutter.
 		pcall(function()
 			local pos = hrp.Position
 			local move = hum.MoveDirection
 			local moving = move.Magnitude > 0.1
+			local speed = math.clamp(hum.WalkSpeed or 16, 0, 600)
+			local dir = moving and move.Unit or Vector3.new(0, 0, 0)
+			local desired = dir * speed
 			local whitelisted = S.stealOn or S.breakOn or S.treadmillOn
 				or GS.flying or now < GS.suspendUntil
-			local anchor = GS.anchor
-			if anchor and not whitelisted then
-				local delta = Vector3.new(pos.X - anchor.X, 0, pos.Z - anchor.Z)
-				local speed = math.clamp(hum.WalkSpeed or 16, 0, 600)
-				-- idle means horizontal position is locked outright: the server's
-				-- knockback is a continuous shove, so any tolerance accumulates.
-				local allowed = moving and (speed * elapsed + 0.5) or 0
-				if delta.Magnitude > allowed then
+			local pred = GS.pred
+			if whitelisted or not pred then
+				GS.pred = Vector3.new(pos.X, 0, pos.Z)
+			else
+				local nx = pred.X + desired.X * elapsed
+				local nz = pred.Z + desired.Z * elapsed
+				local delta = Vector3.new(pos.X - nx, 0, pos.Z - nz)
+				local v0 = hrp.AssemblyLinearVelocity
+				local flat0 = Vector3.new(v0.X, 0, v0.Z)
+				-- blocked by a wall or stopped by a collision: accept reality so
+				-- the predicted line does not drag the player through geometry.
+				local blocked = moving and delta:Dot(dir) < -0.5
+					and flat0.Magnitude < speed * 0.25
+				if blocked then
+					GS.pred = Vector3.new(pos.X, 0, pos.Z)
+				elseif delta.Magnitude > 0.75 then
+					-- ease the correction back instead of teleporting the full
+					-- distance every tick. a big shove still gets fully undone;
+					-- the tiny continuous server nudges fade out smoothly so
+					-- walking does not look like stuttering.
+					local mag = delta.Magnitude
+					local alpha = mag > 3 and 1 or 0.5
 					local rot = hrp.CFrame - hrp.Position
-					hrp.CFrame = CFrame.new(Vector3.new(anchor.X, pos.Y, anchor.Z)) * rot
-					hrp.AssemblyLinearVelocity = Vector3.new(0, hrp.AssemblyLinearVelocity.Y, 0)
-					pos = hrp.Position
+					hrp.CFrame = CFrame.new(Vector3.new(
+						pos.X - delta.X * alpha,
+						pos.Y,
+						pos.Z - delta.Z * alpha
+					)) * rot
 					GOD.anchorHits = (GOD.anchorHits or 0) + 1
+					pos = hrp.Position
+					hrp.AssemblyLinearVelocity = Vector3.new(desired.X, v0.Y, desired.Z)
+					GS.pred = Vector3.new(nx, 0, nz)
+				else
+					-- leave a sub-0.75 offset alone; it never compounds because
+					-- the predicted line advances independently of real position.
+					GS.pred = Vector3.new(nx, 0, nz)
 				end
 			end
-			GS.anchor = Vector3.new(pos.X, 0, pos.Z)
 
 			local v = hrp.AssemblyLinearVelocity
-			local limit = math.max(math.clamp(hum.WalkSpeed or 16, 0, 600), S.godKnockbackLimit)
+			local limit = math.max(speed, S.godKnockbackLimit)
 			local flat = Vector3.new(v.X, 0, v.Z)
 			if moving then
-				local desired = move.Unit * limit
-				if (flat - desired).Magnitude > 1 then
-					hrp.AssemblyLinearVelocity = Vector3.new(desired.X, v.Y, desired.Z)
+				local want = dir * limit
+				if (flat - want).Magnitude > 1 then
+					hrp.AssemblyLinearVelocity = Vector3.new(want.X, v.Y, want.Z)
 				end
 			elseif flat.Magnitude > S.godKnockbackLimit then
 				hrp.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
@@ -2027,7 +2053,7 @@ do
 		restoreNoclip()
 		GS.hum, GS.hrp = hum, hrp
 		GS.lastPos = hrp.Position
-		GS.anchor = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+		GS.pred = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
 		GS.suspendUntil = os.clock() + 1.5
 		installHooks()
 		hardSetHealth()
@@ -2040,7 +2066,7 @@ do
 		local hrp = GS.hrp or root()
 		if hrp then
 			GS.lastPos = hrp.Position
-			GS.anchor = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+			GS.pred = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
 			GS.suspendUntil = os.clock() + 0.15
 		end
 	end
