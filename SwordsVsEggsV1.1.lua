@@ -1804,7 +1804,7 @@ end
 -- the template's anti-teleport would fight our own farm teleports, so every hub
 -- teleport calls GOD.sync() and farming modes whitelist movement automatically.
 -- ============================================================================
-local GOD = { flySpeed = 85, sync = function() end, apply = function() end, stats = function() end, cleanup = function() end }
+local GOD = { flySpeed = 85, pvpClears = 0, sync = function() end, apply = function() end, stats = function() end, cleanup = function() end }
 do
 	local Shared = (type(getgenv) == "function" and getgenv() or shared)
 	Shared.ElenaGodShared = Shared.ElenaGodShared or {}
@@ -1869,6 +1869,69 @@ do
 			local amount = S.godMode and 1e6 or 100
 			GS.hum.MaxHealth = amount
 			GS.hum.Health = amount
+		end)
+	end
+
+	-- the PvP server writes SlashPvPKnockbackUntil on every landed hit. the game
+	-- client uses that attribute as a local stun/lock flag, so clearing it is what
+	-- actually makes god mode feel immune instead of merely showing big health.
+	local clearedPvpUntil, lastCancelAt = 0, 0
+	function GOD.clearPvpLock()
+		if not S.godMode then
+			return
+		end
+		local now = os.clock()
+		if now - clearedPvpUntil < 0.05 then
+			return
+		end
+		clearedPvpUntil = now
+		pcall(function()
+			if LocalPlayer:GetAttribute("SlashPvPKnockbackUntil") ~= 0 then
+				LocalPlayer:SetAttribute("SlashPvPKnockbackUntil", 0)
+			end
+			if LocalPlayer:GetAttribute("SlashSlowMode") then
+				LocalPlayer:SetAttribute("SlashSlowMode", false)
+			end
+		end)
+		GOD.pvpClears = (GOD.pvpClears or 0) + 1
+	end
+
+	function GOD.cancelLaunch()
+		local hum, hrp = GS.hum, GS.hrp
+		if not hum or not hrp or GS.flying or not S.godKnockback then
+			return
+		end
+		local now = os.clock()
+		if now - lastCancelAt < 0.04 then
+			return
+		end
+		lastCancelAt = now
+		pcall(function()
+			local state = hum:GetState()
+			if state == Enum.HumanoidStateType.Ragdoll
+				or state == Enum.HumanoidStateType.Physics
+				or state == Enum.HumanoidStateType.FallingDown
+				or hum.PlatformStand then
+				hum.PlatformStand = false
+				hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end)
+		pcall(function()
+			local v = hrp.AssemblyLinearVelocity
+			local move = hum.MoveDirection
+			local speed = math.clamp(hum.WalkSpeed or 16, 0, 600)
+			local limit = math.max(speed, S.godKnockbackLimit)
+			local flat = Vector3.new(v.X, 0, v.Z)
+			if move.Magnitude > 0.1 then
+				-- keep the player's own walking direction and ignore any impulse
+				-- that pushes sideways or backwards. Y is left alone for jumps.
+				local desired = move.Unit * limit
+				if (flat - desired).Magnitude > 1 then
+					hrp.AssemblyLinearVelocity = Vector3.new(desired.X, v.Y, desired.Z)
+				end
+			elseif flat.Magnitude > S.godKnockbackLimit then
+				hrp.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+			end
 		end)
 	end
 
@@ -1942,6 +2005,7 @@ do
 		GS.suspendUntil = os.clock() + 1.5
 		installHooks()
 		hardSetHealth()
+		GOD.clearPvpLock()
 		pcall(function() hum.JumpPower = S.godJumpPower end)
 		applyNoclip()
 	end
@@ -1956,6 +2020,8 @@ do
 
 	function GOD.apply()
 		hardSetHealth()
+		GOD.clearPvpLock()
+		GOD.cancelLaunch()
 		if GS.hum then
 			pcall(function() GS.hum.JumpPower = S.godJumpPower end)
 		end
@@ -1983,6 +2049,8 @@ do
 			noclip = S.godNoclip,
 			fly = GS.flying,
 			flySpeed = S.godFlySpeed,
+			pvpClears = GOD.pvpClears or 0,
+			pvpLock = LocalPlayer:GetAttribute("SlashPvPKnockbackUntil") or 0,
 			walkSpeed = GS.hum and GS.hum.WalkSpeed or 0,
 			health = GS.hum and GS.hum.Health or 0,
 			maxHealth = GS.hum and GS.hum.MaxHealth or 0,
@@ -2011,25 +2079,10 @@ do
 					hum.Health = hum.MaxHealth
 				end
 			end)
+			GOD.clearPvpLock()
 		end
 		if S.godKnockback and not GS.flying then
-			local velocity = hrp.AssemblyLinearVelocity
-			local flat = Vector3.new(velocity.X, 0, velocity.Z)
-			local falling = hum:GetState() == Enum.HumanoidStateType.FallingDown
-			local moving = hum.MoveDirection.Magnitude > 0.1
-			-- only clamp an actual launch, never normal walk speed. fast walk can
-			-- sit far above the template's 45 stud knockback cap while moving.
-			if flat.Magnitude > S.godKnockbackLimit and (falling or not moving) then
-				local direction = flat.Unit
-				hrp.AssemblyLinearVelocity = Vector3.new(
-					direction.X * S.godKnockbackLimit,
-					velocity.Y,
-					direction.Z * S.godKnockbackLimit
-				)
-			end
-			if falling then
-				pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
-			end
+			GOD.cancelLaunch()
 		end
 		if S.godVoid and hrp.Position.Y < -60 then
 			local spawn = workspace:FindFirstChildOfClass("SpawnLocation")
@@ -3085,6 +3138,7 @@ local function ragTick()
 		S.baseHip = hum.HipHeight
 	end
 	hum.PlatformStand = false
+	GOD.clearPvpLock()
 	pcall(function()
 		hum:ChangeState(Enum.HumanoidStateType.Running)
 	end)
@@ -3189,6 +3243,7 @@ local function antiHitTick()
 		if LocalPlayer.Character and LocalPlayer.Character:GetAttribute("Ragdolled") then
 			LocalPlayer.Character:SetAttribute("Ragdolled", false)
 		end
+		GOD.clearPvpLock()
 	end
 	if not victim then
 		return
@@ -5142,7 +5197,7 @@ table.insert(
 			pcall(guardTick)
 		end
 
-		if S.antiRag and now - (S.ragAt or 0) > 0.12 then
+		if (S.antiRag or (S.godMode and S.godKnockback)) and now - (S.ragAt or 0) > 0.12 then
 			S.ragAt = now
 			pcall(ragTick)
 		end
@@ -5640,7 +5695,12 @@ HUB.debug = {
 			S.AntiStealTick()
 			S.AntiHitTick()
 		end)
-		return ok, err
+		return ok, err, GOD.pvpClears
+	end,
+	godTick = function()
+		GOD.clearPvpLock()
+		GOD.cancelLaunch()
+		return GOD.stats()
 	end,
 	counter = function(player)
 		return counterSlash(player)
