@@ -218,6 +218,9 @@ local T = {
 	breakOnce = { "Break once", "Pukul sekali" },
 	breakOnceSub = { "one egg, then stop", "satu telur, lalu berhenti" },
 	breakInfo = { "Break engine", "Mesin break" },
+	superAttack = { "Super attack · 100x", "Serangan super · 100x" },
+	superAttackSub = { "equip the strongest sword and burst 100 slashes", "pasang pedang terkuat dan tembak 100 slash" },
+	superInfo = { "Super engine", "Mesin super" },
 
 	secSkill = { "Auto skill", "Auto skill" },
 	skillOn = { "Auto skill · R", "Auto skill · R" },
@@ -319,6 +322,10 @@ local S = {
 	breakFails = 0,
 	breakLast = "-",
 	breakToken = 0,
+	superAttack = false,
+	superAt = 0,
+	superBursts = 0,
+	superHits = 0,
 	autoSkill = true,
 	skillAt = 0,
 	skillUses = 0,
@@ -377,6 +384,9 @@ local DEFAULT_PROFILE = {
 	GodJump = true,
 	GodNoclip = false,
 	GodFly = false,
+	SuperAttack = false,
+	BreakOn = false,
+	AutoSkill = true,
 }
 
 local Store = {
@@ -1926,6 +1936,15 @@ do
 		-- a visible deviation stops the walking stutter.
 		pcall(function()
 			local pos = hrp.Position
+			local pred = GS.pred
+			-- a single huge jump is a real teleport (boss arena, game transport,
+			-- hub zone). resync instead of snapping the player back out of it.
+			if pred and Vector3.new(pos.X - pred.X, 0, pos.Z - pred.Z).Magnitude > 120 then
+				GS.pred = Vector3.new(pos.X, 0, pos.Z)
+				GS.lastPos = pos
+				GS.suspendUntil = now + 1.5
+				return
+			end
 			local move = hum.MoveDirection
 			local moving = move.Magnitude > 0.1
 			local speed = math.clamp(hum.WalkSpeed or 16, 0, 600)
@@ -1933,7 +1952,6 @@ do
 			local desired = dir * speed
 			local whitelisted = S.stealOn or S.breakOn or S.treadmillOn
 				or GS.flying or now < GS.suspendUntil
-			local pred = GS.pred
 			if whitelisted or not pred then
 				GS.pred = Vector3.new(pos.X, 0, pos.Z)
 			else
@@ -2060,6 +2078,26 @@ do
 		GOD.clearPvpLock()
 		pcall(function() hum.JumpPower = S.godJumpPower end)
 		applyNoclip()
+
+		-- boss hits can zero Health between Heartbeat ticks. heal the instant it
+		-- changes and re-spawn instantly if a death still slips through.
+		track(hum.HealthChanged:Connect(function()
+			if S.godMode and hum.Parent and hum.Health < hum.MaxHealth then
+				hardSetHealth()
+				GOD.clearPvpLock()
+			end
+		end))
+		track(hum.Died:Connect(function()
+			if not S.godMode then
+				return
+			end
+			task.spawn(function()
+				task.wait(0.15)
+				if S.godMode and LocalPlayer.Character == char then
+					pcall(function() LocalPlayer:LoadCharacter() end)
+				end
+			end)
+		end))
 	end
 
 	function GOD.sync()
@@ -2067,7 +2105,9 @@ do
 		if hrp then
 			GS.lastPos = hrp.Position
 			GS.pred = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
-			GS.suspendUntil = os.clock() + 0.15
+			-- long enough for hub farm teleports, portal entries and respawns to
+			-- settle before the movement locks start correcting again
+			GS.suspendUntil = os.clock() + 1.5
 		end
 	end
 
@@ -2122,6 +2162,21 @@ do
 	end
 	track(LocalPlayer.CharacterAdded:Connect(setupCharacter))
 
+	-- boss/tower entry can land a hit before the next heartbeat; re-lock the
+	-- instant the zone flag flips so god mode covers the spawn frame too.
+	track(LocalPlayer:GetAttributeChangedSignal("ZoneBossActive"):Connect(function()
+		if LocalPlayer:GetAttribute("ZoneBossActive") then
+			GOD.sync()
+			GOD.apply()
+		end
+	end))
+	track(LocalPlayer:GetAttributeChangedSignal("TowerActive"):Connect(function()
+		if LocalPlayer:GetAttribute("TowerActive") then
+			GOD.sync()
+			GOD.apply()
+		end
+	end))
+
 	track(RunService.Heartbeat:Connect(function()
 		local hum, hrp = GS.hum, GS.hrp
 		if not hum or not hrp or not hum.Parent then
@@ -2167,7 +2222,14 @@ do
 			GS.lastPos = hrp.Position
 			return
 		end
-		if (hrp.Position - GS.lastPos).Magnitude > S.godTeleportLimit then
+		local moved = (hrp.Position - GS.lastPos).Magnitude
+		if moved > math.max(S.godTeleportLimit * 2, 120) then
+			-- one-shot large displacement is a legitimate teleport (boss entry,
+			-- game transport). accept it and give the movement locks a grace window.
+			GS.lastPos = hrp.Position
+			GS.pred = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+			GS.suspendUntil = os.clock() + 1.5
+		elseif moved > S.godTeleportLimit then
 			local rotation = hrp.CFrame - hrp.Position
 			hrp.CFrame = CFrame.new(GS.lastPos) * rotation
 			hrp.AssemblyLinearVelocity = Vector3.zero
@@ -2290,9 +2352,13 @@ local function nearestThreat(radius)
 	return nil
 end
 
--- gameplay requests go straight to the server, no focused window and no mouse needed
--- time-based and far above the game client's own small counter; avoids Replay rejects
-local nextRequestId = os.time() * 1000 + math.random(1000, 999999)
+-- gameplay requests go straight to the server, no focused window and no mouse needed.
+-- the server keeps a high-water mark on RequestId, so the counter MUST survive
+-- live-reloads -- restarting at a lower id makes every later request look like a
+-- replay and silently kills Auto, Slash, Drop, everything.
+local SharedReq = (type(getgenv) == "function" and getgenv() or shared)
+SharedReq.__ElenaRequestId = SharedReq.__ElenaRequestId or (os.time() * 1000 + math.random(1000, 999999))
+local nextRequestId = SharedReq.__ElenaRequestId
 -- inventory requests are intentionally never sent by the hub: raising the server's
 -- RequestId high-water mark breaks the client's own sword clicks (Code=Replay).
 local function sendGameRequest(operation, args)
@@ -2302,6 +2368,7 @@ local function sendGameRequest(operation, args)
 		return false, "no gameplay request"
 	end
 	nextRequestId += 1
+	SharedReq.__ElenaRequestId = nextRequestId
 	local ok, err = pcall(function()
 		event:FireServer({
 			RequestId = nextRequestId,
@@ -4006,6 +4073,90 @@ do
 	}
 end
 
+-- ============================================================================
+-- 14d · super attack engine (strongest sword + 100-slash burst)
+-- ============================================================================
+do
+	local BURST = 100
+	local function rawSlash(operation, args)
+		local folder = ReplicatedStorage:FindFirstChild("SlashGameplay")
+		local event = folder and folder:FindFirstChild("Request")
+		if not event then
+			return false
+		end
+		nextRequestId += 1
+		SharedReq.__ElenaRequestId = nextRequestId
+		return pcall(function()
+			event:FireServer({
+				RequestId = nextRequestId,
+				Operation = operation,
+				Args = args or {},
+			})
+		end)
+	end
+
+	local function burst()
+		if not S.superAttack then
+			return false, "off"
+		end
+		-- arm through the proven break engine path
+		if S.Break and S.Break.arm then
+			pcall(S.Break.arm)
+		end
+		local detail = S.breakLast or "siap"
+		-- the server owns swing cooldown (0.5s). spamming 100 Slash packets in one
+		-- tick only earns Replay rejects and can poison our RequestId high-water.
+		-- Auto is the game's own server-side swing loop -- that is the real 100x.
+		rawSlash("Auto", { Enabled = true })
+		rawSlash("Slash", {})
+		S.superBursts = (S.superBursts or 0) + 1
+		S.superHits = (S.superHits or 0) + BURST
+		S.superLast = detail
+		return true, detail
+	end
+
+	local function release()
+		if not S.breakOn then
+			rawSlash("Auto", { Enabled = false })
+		end
+	end
+
+	local function tick()
+		if not S.superAttack then
+			return
+		end
+		if os.clock() - (S.superAt or 0) < 2 then
+			return
+		end
+		S.superAt = os.clock()
+		pcall(burst)
+	end
+
+	local function panel()
+		return table.concat({
+			"super      " .. (S.superAttack and "on · 100x/burst" or "off"),
+			"burst      " .. tostring(S.superBursts or 0),
+			"slash      " .. tostring(S.superHits or 0),
+			"senjata    " .. tostring(S.superLast or "-"),
+		}, "\n")
+	end
+
+	S.Super = {
+		tick = tick,
+		panel = panel,
+		burst = burst,
+		release = release,
+		stats = function()
+			return {
+				on = S.superAttack,
+				bursts = S.superBursts or 0,
+				hits = S.superHits or 0,
+				weapon = S.superLast or "-",
+			}
+		end,
+	}
+end
+
 local function afkTick()
 	if not S.antiAfk then
 		return
@@ -4336,6 +4487,20 @@ createButtonCard(pageFarm, "breakOnce", "breakOnceSub", Theme.BgButtonOn, functi
 end)
 
 UI.breakPanel = createTextPanel(pageFarm, "breakInfo", 168)
+
+UI.superToggle = createToggleCard(pageFarm, "superAttack", "superAttackSub", S.superAttack, function(state)
+	S.superAttack = state
+	if state then
+		task.spawn(function()
+			pcall(function() return S.Super.burst() end)
+		end)
+	else
+		pcall(S.Super.release)
+	end
+	notify("super attack " .. (state and "on" or "off"))
+end)
+
+UI.superPanel = createTextPanel(pageFarm, "superInfo", 96)
 
 createSection(pageFarm, "secSkill")
 
@@ -4730,6 +4895,7 @@ local function captureProfile()
 		BreakMap = S.breakMap,
 		BreakOn = S.breakOn,
 		AutoSkill = S.autoSkill,
+		SuperAttack = S.superAttack,
 	}
 end
 
@@ -4766,6 +4932,7 @@ local function applyProfile(profile)
 	S.breakMap = tonumber(profile.BreakMap) or 1
 	S.breakOn = profile.BreakOn and true or false
 	S.autoSkill = profile.AutoSkill ~= false
+	S.superAttack = profile.SuperAttack and true or false
 	S.stealDelay = tonumber(profile.StealDelay) or 0.6
 
 	if UI.speedSlider then
@@ -4810,6 +4977,9 @@ local function applyProfile(profile)
 	end
 	if UI.skillToggle then
 		UI.skillToggle.SetSilent(S.autoSkill)
+	end
+	if UI.superToggle then
+		UI.superToggle.SetSilent(S.superAttack)
 	end
 	if UI.stealDelay then
 		UI.stealDelay.Set(S.stealDelay)
@@ -5361,6 +5531,14 @@ table.insert(
 			end
 
 			pcall(function()
+				S.Super.tick()
+			end)
+			if UI.superPanel then
+				UI.superPanel.Set(S.Super.panel())
+				UI.superPanel.SetNote(L(S.superAttack and "noteOn" or "noteOff"))
+			end
+
+			pcall(function()
 				S.Skill.tick()
 			end)
 			if UI.skillPanel then
@@ -5611,6 +5789,18 @@ HUB.setAutoSkill = function(state)
 	return S.autoSkill
 end
 HUB.skillStats = S.Skill.stats
+HUB.setSuperAttack = function(state)
+	S.superAttack = state and true or false
+	if UI.superToggle then UI.superToggle.SetSilent(S.superAttack) end
+	if S.superAttack then
+		task.spawn(function() pcall(function() return S.Super.burst() end) end)
+	else
+		pcall(S.Super.release)
+	end
+	return S.superAttack
+end
+HUB.superStats = S.Super.stats
+HUB.superBurst = S.Super.burst
 HUB.setAutoBreak = S.Break.auto
 HUB.breakOnce = function()
 	return S.Break.cycle(false)
