@@ -1804,13 +1804,14 @@ end
 -- the template's anti-teleport would fight our own farm teleports, so every hub
 -- teleport calls GOD.sync() and farming modes whitelist movement automatically.
 -- ============================================================================
-local GOD = { flySpeed = 85, pvpClears = 0, sync = function() end, apply = function() end, stats = function() end, cleanup = function() end }
+local GOD = { flySpeed = 85, pvpClears = 0, anchorHits = 0, sync = function() end, apply = function() end, stats = function() end, cleanup = function() end }
 do
 	local Shared = (type(getgenv) == "function" and getgenv() or shared)
 	Shared.ElenaGodShared = Shared.ElenaGodShared or {}
 	local GS = Shared.ElenaGodShared
 	GS.hum, GS.hrp, GS.lastPos = nil, nil, nil
 	GS.suspendUntil, GS.flying = 0, false
+	GS.anchor, GS.anchorAt = nil, 0
 
 	local rawIndex, rawNewIndex, hooksInstalled
 	local noclipMemory, flyBV, flyBG = {}, nil, nil
@@ -1877,7 +1878,7 @@ do
 	-- actually makes god mode feel immune instead of merely showing big health.
 	local clearedPvpUntil, lastCancelAt = 0, 0
 	function GOD.clearPvpLock()
-		if not S.godMode then
+		if not (S.godMode and S.godKnockback) then
 			return
 		end
 		local now = os.clock()
@@ -1902,7 +1903,8 @@ do
 			return
 		end
 		local now = os.clock()
-		if now - lastCancelAt < 0.04 then
+		local elapsed = now - lastCancelAt
+		if elapsed < 0.04 then
 			return
 		end
 		lastCancelAt = now
@@ -1916,15 +1918,38 @@ do
 				hum:ChangeState(Enum.HumanoidStateType.Running)
 			end
 		end)
+
+		-- The server applies PvP knockback authoritatively: impulse, BodyVelocity or
+		-- a direct CFrame shove. Killing velocity alone cannot win that fight, so
+		-- keep a horizontal anchor and undo ANY displacement the player did not
+		-- ask for. Hub teleports/farming whitelist themselves through GOD.sync().
 		pcall(function()
-			local v = hrp.AssemblyLinearVelocity
+			local pos = hrp.Position
 			local move = hum.MoveDirection
-			local speed = math.clamp(hum.WalkSpeed or 16, 0, 600)
-			local limit = math.max(speed, S.godKnockbackLimit)
+			local moving = move.Magnitude > 0.1
+			local whitelisted = S.stealOn or S.breakOn or S.treadmillOn
+				or GS.flying or now < GS.suspendUntil
+			local anchor = GS.anchor
+			if anchor and not whitelisted then
+				local delta = Vector3.new(pos.X - anchor.X, 0, pos.Z - anchor.Z)
+				local speed = math.clamp(hum.WalkSpeed or 16, 0, 600)
+				-- idle means horizontal position is locked outright: the server's
+				-- knockback is a continuous shove, so any tolerance accumulates.
+				local allowed = moving and (speed * elapsed + 0.5) or 0
+				if delta.Magnitude > allowed then
+					local rot = hrp.CFrame - hrp.Position
+					hrp.CFrame = CFrame.new(Vector3.new(anchor.X, pos.Y, anchor.Z)) * rot
+					hrp.AssemblyLinearVelocity = Vector3.new(0, hrp.AssemblyLinearVelocity.Y, 0)
+					pos = hrp.Position
+					GOD.anchorHits = (GOD.anchorHits or 0) + 1
+				end
+			end
+			GS.anchor = Vector3.new(pos.X, 0, pos.Z)
+
+			local v = hrp.AssemblyLinearVelocity
+			local limit = math.max(math.clamp(hum.WalkSpeed or 16, 0, 600), S.godKnockbackLimit)
 			local flat = Vector3.new(v.X, 0, v.Z)
-			if move.Magnitude > 0.1 then
-				-- keep the player's own walking direction and ignore any impulse
-				-- that pushes sideways or backwards. Y is left alone for jumps.
+			if moving then
 				local desired = move.Unit * limit
 				if (flat - desired).Magnitude > 1 then
 					hrp.AssemblyLinearVelocity = Vector3.new(desired.X, v.Y, desired.Z)
@@ -2002,6 +2027,7 @@ do
 		restoreNoclip()
 		GS.hum, GS.hrp = hum, hrp
 		GS.lastPos = hrp.Position
+		GS.anchor = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
 		GS.suspendUntil = os.clock() + 1.5
 		installHooks()
 		hardSetHealth()
@@ -2014,6 +2040,7 @@ do
 		local hrp = GS.hrp or root()
 		if hrp then
 			GS.lastPos = hrp.Position
+			GS.anchor = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
 			GS.suspendUntil = os.clock() + 0.15
 		end
 	end
@@ -2050,6 +2077,7 @@ do
 			fly = GS.flying,
 			flySpeed = S.godFlySpeed,
 			pvpClears = GOD.pvpClears or 0,
+			anchorHits = GOD.anchorHits or 0,
 			pvpLock = LocalPlayer:GetAttribute("SlashPvPKnockbackUntil") or 0,
 			walkSpeed = GS.hum and GS.hum.WalkSpeed or 0,
 			health = GS.hum and GS.hum.Health or 0,
